@@ -1,4 +1,4 @@
-FINAL AWS DEVOPS PROJECT 
+FINAL AWS DEVOPS PROJECT (WITH COMMANDS)
 PROJECT OBJECTIVE
 
 Build a highly available web application on AWS using EC2, ALB, ASG, EFS, RDS, S3, IAM, and VPC.
@@ -7,15 +7,17 @@ The application must survive EC2 failure and retain database data.
 1. IAM ROLE (SECURITY)
 What I did
 
-Created an IAM role for EC2 so instances can access S3, EFS, and CloudWatch without access keys.
+Created an IAM Role for EC2 so instances can access AWS services without hardcoding access keys.
 
-Policies attached
+Policies Attached
 
 AmazonS3ReadOnlyAccess
 
 AmazonElasticFileSystemClientReadWriteAccess
 
-CloudWatchAgentServerPolicy
+CloudWatchAgentServerPolicy 
+
+This IAM role is later attached in the Launch Template.
 
 
 2. VPC & NETWORKING
@@ -25,13 +27,13 @@ CIDR: 10.0.0.0/16
 
 Subnets
 
-Public:
+Public Subnets
 
 10.0.1.0/24 (AZ-a)
 
 10.0.2.0/24 (AZ-b)
 
-Private:
+Private Subnets
 
 10.0.3.0/24 (AZ-a)
 
@@ -39,11 +41,14 @@ Private:
 
 3. INTERNET GATEWAY & NAT GATEWAY
 
-Created Internet Gateway and attached to VPC.
+Created Internet Gateway (IGW) and attached it to the VPC.
 
 Created NAT Gateway in a public subnet.
 
-Assigned Elastic IP to NAT Gateway.
+Assigned an Elastic IP to the NAT Gateway.
+
+Reason:
+Private subnet resources need internet access for updates, but must not be publicly reachable.
 
 4. ROUTE TABLES
 Public Route Table
@@ -65,7 +70,10 @@ Route:
 Associated with both private subnets.
 
 5. S3 BUCKET (STATIC CONTENT)
-Commands used
+Commands Used
+
+Create bucket:
+
 aws s3 mb s3://webapp-static-devopsprojcaws
 
 
@@ -82,7 +90,7 @@ echo "Hello from S3" > index.html
 aws s3 cp index.html s3://webapp-static-devopsprojcaws/
 
 6. EC2 (SINGLE INSTANCE – TESTING PHASE)
-Instance configuration
+Instance Configuration
 
 AMI: Amazon Linux
 
@@ -92,9 +100,9 @@ Subnet: Public subnet
 
 IAM Role: Attached
 
-Security Group: HTTP + SSH
+Security Group: SSH (22), HTTP (80)
 
-USER DATA SCRIPT (USED)
+User Data Script
 #!/bin/bash
 yum update -y
 yum install -y httpd amazon-efs-utils mysql
@@ -105,13 +113,13 @@ systemctl enable httpd
 aws s3 cp s3://webapp-static-devopsprojcaws/index.html /var/www/html/index.html
 
 7. EBS VOLUME ATTACHMENT
-Create EBS
+EBS Details
 
 Size: 5 GB
 
-AZ: Same as EC2
+Availability Zone: Same as EC2
 
-Commands used
+Commands Used
 lsblk
 sudo mkfs -t xfs /dev/xvdf
 sudo mkdir /data
@@ -119,13 +127,13 @@ sudo mount /dev/xvdf /data
 df -h
 
 8. EFS (SHARED STORAGE)
-On AWS Console
+AWS Console
 
 Created EFS in same VPC
 
 Created mount targets in all AZs
 
-Allowed NFS (2049) from EC2 SG
+Allowed NFS (2049) from EC2 Security Group
 
 On EC2
 sudo yum install -y amazon-efs-utils
@@ -137,9 +145,9 @@ df -h
 
 ALB created in public subnets
 
-Listener: HTTP 80
+Listener: HTTP (80)
 
-Target group: Instance type
+Target Group: Instance
 
 Health check path: /
 
@@ -153,7 +161,7 @@ Instance type
 
 IAM role
 
-EC2 security group
+Security group
 
 User data script
 
@@ -172,19 +180,19 @@ Max: 3
 Attached to ALB target group
 
 12. RDS MYSQL (PRIVATE SUBNET)
-RDS setup
+RDS Setup
 
 Engine: MySQL
 
-Multi-AZ enabled
+Multi-AZ: Enabled
 
 Public access: Disabled
 
 DB subnet group: Private subnets
 
-Security group: MySQL 3306 from EC2 SG only
+Security group: MySQL (3306) from EC2 SG only
 
-MYSQL CLIENT INSTALL (ON EC2)
+MySQL Client Installation
 sudo dnf search mariadb
 sudo dnf install mariadb105 -y
 mysql --version
@@ -196,10 +204,10 @@ sudo dnf install https://dev.mysql.com/get/mysql80-community-release-el9-1.noarc
 sudo dnf install mysql-community-client --nogpgcheck -y
 mysql --version
 
-CONNECT TO RDS
+Connect to RDS
 mysql -h rds-mysql-private.cp2gocew6omt.ap-south-1.rds.amazonaws.com -u admin -p
 
-DATABASE COMMANDS
+Database Commands
 CREATE DATABASE devopsdb;
 SHOW DATABASES;
 USE devopsdb;
@@ -213,8 +221,8 @@ SHOW TABLES;
 INSERT INTO users VALUES (1,'ec2-one');
 SELECT * FROM users;
 
-13. FLASK APPLICATION (TEST HIGH AVAILABILITY)
-Install packages
+13. FLASK APPLICATION (HIGH AVAILABILITY TEST)
+Install Packages
 sudo dnf install python3 -y
 sudo dnf install python3-pip -y
 pip3 install flask pymysql
@@ -263,15 +271,17 @@ python3 app.py
 14. HIGH AVAILABILITY TEST
 Steps
 
-Access app via ALB DNS
+Access application via ALB DNS
 
-Terminate one EC2 manually
+Manually terminate one EC2
 
-ASG launches new EC2
+ASG launches a new EC2 automatically
 
-Database data unchanged
+Application remains accessible
 
-Test command on multiple EC2
+Database data remains unchanged
+
+Verification Command (on multiple EC2)
 USE devopsdb;
 SELECT * FROM users;
 exit;
