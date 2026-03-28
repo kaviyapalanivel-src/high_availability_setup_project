@@ -1,287 +1,191 @@
-FINAL AWS DEVOPS PROJECT (WITH COMMANDS)
-PROJECT OBJECTIVE
+# Highly Available Web Application on AWS
 
-Build a highly available web application on AWS using EC2, ALB, ASG, EFS, RDS, S3, IAM, and VPC.
-The application must survive EC2 failure and retain database data.
+A fault-tolerant, multi-tier web application deployed on AWS using EC2, ALB, Auto Scaling, EFS, RDS (Multi-AZ), S3, and VPC — designed to remain available and retain data integrity through individual instance or AZ-level failures.
 
-1. IAM ROLE (SECURITY)
-What I did
+## Architecture
 
-Created an IAM Role for EC2 so instances can access AWS services without hardcoding access keys.
+```
+                          ┌─────────────────────┐
+                          │   Users (Internet)   │
+                          └──────────┬──────────┘
+                                     │
+                          ┌──────────▼──────────┐
+                          │  Application Load   │
+                          │  Balancer (ALB)     │
+                          │  public subnets     │
+                          └────┬──────────┬─────┘
+                               │          │
+              ┌────────────────▼──┐  ┌────▼──────────────┐
+              │  EC2 (AZ-a)       │  │  EC2 (AZ-b)        │
+              │  Private subnet   │  │  Private subnet    │
+              │  Flask + Apache   │  │  Flask + Apache    │
+              └────────┬──────────┘  └──────────┬─────────┘
+                       │    Auto Scaling Group   │
+                       │    (min 1 / max 3)      │
+                       └────────┬────────────────┘
+                    ┌───────────▼──────────────┐
+                    │       Amazon EFS          │
+                    │  (shared /efs mount)      │
+                    └───────────┬──────────────┘
+                    ┌───────────▼──────────────┐
+                    │    RDS MySQL (Multi-AZ)   │
+                    │    Private subnets only   │
+                    └──────────────────────────┘
+```
 
-Policies Attached
+**Region:** ap-south-1 (Mumbai)  
+**Availability Zones:** ap-south-1a, ap-south-1b  
+**Application:** Python Flask REST API reading/writing to MySQL via RDS
 
-AmazonS3ReadOnlyAccess
+---
 
-AmazonElasticFileSystemClientReadWriteAccess
+## Network Design
 
-CloudWatchAgentServerPolicy 
+### VPC: `10.0.0.0/16`
 
-This IAM role is later attached in the Launch Template.
+| Subnet | CIDR | AZ | Type |
+|---|---|---|---|
+| public-1a | 10.0.1.0/24 | ap-south-1a | Public |
+| public-1b | 10.0.2.0/24 | ap-south-1b | Public |
+| private-1a | 10.0.3.0/24 | ap-south-1a | Private |
+| private-1b | 10.0.4.0/24 | ap-south-1b | Private |
 
+**Routing:**
+- Public subnets → Internet Gateway (for ALB and NAT Gateway)
+- Private subnets → NAT Gateway (outbound-only internet for EC2 updates/installs; no inbound public exposure)
 
-2. VPC & NETWORKING
-VPC
+**Security Groups:**
+- `alb-sg`: inbound 80 from 0.0.0.0/0
+- `ec2-sg`: inbound 80 from `alb-sg` only; inbound 22 from admin IP only
+- `rds-sg`: inbound 3306 from `ec2-sg` only
+- `efs-sg`: inbound 2049 (NFS) from `ec2-sg` only
 
-CIDR: 10.0.0.0/16
+---
 
-Subnets
+## IAM Role (EC2)
 
-Public Subnets
+A single IAM role is attached to EC2 instances via the Launch Template — no hardcoded credentials anywhere.
 
-10.0.1.0/24 (AZ-a)
+| Policy | Purpose |
+|---|---|
+| `AmazonS3ReadOnlyAccess` | Pull static assets from S3 at boot |
+| `AmazonElasticFileSystemClientReadWriteAccess` | Mount EFS shared storage |
+| `CloudWatchAgentServerPolicy` | Ship metrics and logs to CloudWatch |
 
-10.0.2.0/24 (AZ-b)
+---
 
-Private Subnets
+## Storage
 
-10.0.3.0/24 (AZ-a)
+### S3 — Static Content
+Bucket `webapp-static-devopsprojcaws` holds the application's `index.html`. EC2 instances pull this file during bootstrap via User Data, keeping the AMI generic and content-updateable without re-baking images.
 
-10.0.4.0/24 (AZ-b)
+Versioning is enabled on the bucket to support rollback.
 
-3. INTERNET GATEWAY & NAT GATEWAY
+### EFS — Shared Application Storage
+EFS is mounted at `/efs` on all EC2 instances. This ensures that any file written by one instance (e.g. uploaded content, logs) is immediately visible to all other instances behind the ALB — a requirement for stateful shared storage across a horizontally scaled fleet.
 
-Created Internet Gateway (IGW) and attached it to the VPC.
+Mount targets are created in both private subnets to survive an AZ failure.
 
-Created NAT Gateway in a public subnet.
+### RDS MySQL — Application Database
+- Engine: MySQL 8.0
+- Multi-AZ: **Enabled** (synchronous standby in ap-south-1b)
+- Deployed in private subnets — no public endpoint
+- Automated backups: 7-day retention
 
-Assigned an Elastic IP to the NAT Gateway.
+Multi-AZ ensures that if the primary DB instance or its AZ becomes unavailable, RDS automatically fails over to the standby replica with no manual intervention and minimal downtime (~60–120 seconds).
 
-Reason:
-Private subnet resources need internet access for updates, but must not be publicly reachable.
+---
 
-4. ROUTE TABLES
-Public Route Table
+## Application
 
-Route:
+A minimal Flask API with two endpoints to demonstrate live database connectivity through the load balancer:
 
-0.0.0.0/0 → Internet Gateway
+```python
+# GET / → health check
+# GET /users → fetches all rows from RDS MySQL users table
+```
 
+Database credentials are injected via environment variables — not hardcoded. The app connects to the RDS endpoint, which automatically resolves to whichever instance (primary or standby) is currently active.
 
-Associated with both public subnets.
+---
 
-Private Route Table
+## Auto Scaling
 
-Route:
+| Parameter | Value |
+|---|---|
+| Minimum instances | 1 |
+| Desired capacity | 2 |
+| Maximum instances | 3 |
+| Health check | ALB (HTTP 200 on `/`) |
+| Launch Template | Includes IAM role, User Data, security group |
 
-0.0.0.0/0 → NAT Gateway
+The ASG spans both private subnets. If an instance fails its ALB health check, ASG terminates and replaces it automatically. If an AZ goes down, ASG launches replacement capacity in the surviving AZ.
 
+---
 
-Associated with both private subnets.
+## Deployment
 
-5. S3 BUCKET (STATIC CONTENT)
-Commands Used
+### Prerequisites
+- AWS CLI configured with appropriate permissions
+- EC2 key pair for SSH access
+- VPC, subnets, and security groups provisioned as described above
 
-Create bucket:
+### Launch
 
-aws s3 mb s3://webapp-static-devopsprojcaws
+1. **Create Launch Template** with the User Data script below
+2. **Create Target Group** (HTTP, health check on `/`)
+3. **Create ALB** in public subnets, add listener on port 80 forwarding to target group
+4. **Create ASG** using the Launch Template, attached to the ALB target group
 
-
-Enable versioning:
-
-aws s3api put-bucket-versioning \
---bucket webapp-static-devopsprojcaws \
---versioning-configuration Status=Enabled
-
-
-Create and upload file:
-
-echo "Hello from S3" > index.html
-aws s3 cp index.html s3://webapp-static-devopsprojcaws/
-
-6. EC2 (SINGLE INSTANCE – TESTING PHASE)
-Instance Configuration
-
-AMI: Amazon Linux
-
-VPC: Custom VPC
-
-Subnet: Public subnet
-
-IAM Role: Attached
-
-Security Group: SSH (22), HTTP (80)
-
-User Data Script
+**User Data (EC2 bootstrap):**
+```bash
 #!/bin/bash
 yum update -y
-yum install -y httpd amazon-efs-utils mysql
+yum install -y httpd amazon-efs-utils python3 python3-pip
+pip3 install flask pymysql
 
 systemctl start httpd
 systemctl enable httpd
 
+# Pull static content from S3
 aws s3 cp s3://webapp-static-devopsprojcaws/index.html /var/www/html/index.html
 
-7. EBS VOLUME ATTACHMENT
-EBS Details
+# Mount EFS shared storage
+mkdir /efs
+mount -t efs fs-071589de16f9adaaa:/ /efs
+```
 
-Size: 5 GB
+---
 
-Availability Zone: Same as EC2
+## High Availability Test
 
-Commands Used
-lsblk
-sudo mkfs -t xfs /dev/xvdf
-sudo mkdir /data
-sudo mount /dev/xvdf /data
-df -h
+To verify the setup survives instance failure:
 
-8. EFS (SHARED STORAGE)
-AWS Console
+1. Access the application via the **ALB DNS name** — confirm it returns a response
+2. **Manually terminate one EC2 instance** from the console
+3. Observe the ASG launch a replacement instance automatically (typically within 3–5 minutes)
+4. Confirm the ALB continues routing requests to the surviving instance during replacement
+5. After replacement launches, confirm **database data is intact** — the RDS endpoint never changed
 
-Created EFS in same VPC
+```bash
+# Verify data persistence after failover
+mysql -h <rds-endpoint> -u admin -p devopsdb -e "SELECT * FROM users;"
+```
 
-Created mount targets in all AZs
+Expected: all rows present, no data loss — confirming that application state lives in RDS, not on the EC2 instances themselves.
 
-Allowed NFS (2049) from EC2 Security Group
+---
 
-On EC2
-sudo yum install -y amazon-efs-utils
-sudo mkdir /efs
-sudo mount -t efs fs-071589de16f9adaaa:/ /efs
-df -h
+## Technologies
 
-9. APPLICATION LOAD BALANCER (ALB)
-
-ALB created in public subnets
-
-Listener: HTTP (80)
-
-Target Group: Instance
-
-Health check path: /
-
-10. LAUNCH TEMPLATE
-
-Includes:
-
-AMI
-
-Instance type
-
-IAM role
-
-Security group
-
-User data script
-
-11. AUTO SCALING GROUP (ASG)
-
-Launch template attached
-
-Subnets: Private subnets
-
-Min: 1
-
-Desired: 2
-
-Max: 3
-
-Attached to ALB target group
-
-12. RDS MYSQL (PRIVATE SUBNET)
-RDS Setup
-
-Engine: MySQL
-
-Multi-AZ: Enabled
-
-Public access: Disabled
-
-DB subnet group: Private subnets
-
-Security group: MySQL (3306) from EC2 SG only
-
-MySQL Client Installation
-sudo dnf search mariadb
-sudo dnf install mariadb105 -y
-mysql --version
-
-
-If not available:
-
-sudo dnf install https://dev.mysql.com/get/mysql80-community-release-el9-1.noarch.rpm -y
-sudo dnf install mysql-community-client --nogpgcheck -y
-mysql --version
-
-Connect to RDS
-mysql -h rds-mysql-private.cp2gocew6omt.ap-south-1.rds.amazonaws.com -u admin -p
-
-Database Commands
-CREATE DATABASE devopsdb;
-SHOW DATABASES;
-USE devopsdb;
-
-CREATE TABLE users (
-  id INT PRIMARY KEY,
-  name VARCHAR(50)
-);
-
-SHOW TABLES;
-INSERT INTO users VALUES (1,'ec2-one');
-SELECT * FROM users;
-
-13. FLASK APPLICATION (HIGH AVAILABILITY TEST)
-Install Packages
-sudo dnf install python3 -y
-sudo dnf install python3-pip -y
-pip3 install flask pymysql
-
-
-Verify:
-
-python3 -c "import flask, pymysql; print('OK')"
-
-app.py
-from flask import Flask
-import pymysql
-
-app = Flask(__name__)
-
-DB_HOST = "rds-mysql-private.cp2gocew6omt.ap-south-1.rds.amazonaws.com"
-DB_USER = "admin"
-DB_PASSWORD = "password"
-DB_NAME = "devopsdb"
-
-@app.route("/")
-def home():
-    return "Flask + RDS is working"
-
-@app.route("/users")
-def users():
-    conn = pymysql.connect(
-        host=DB_HOST,
-        user=DB_USER,
-        password=DB_PASSWORD,
-        database=DB_NAME
-    )
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM users")
-    data = cur.fetchall()
-    conn.close()
-    return str(data)
-
-app.run(host="0.0.0.0", port=5000)
-
-
-Run:
-
-python3 app.py
-
-14. HIGH AVAILABILITY TEST
-Steps
-
-Access application via ALB DNS
-
-Manually terminate one EC2
-
-ASG launches a new EC2 automatically
-
-Application remains accessible
-
-Database data remains unchanged
-
-Verification Command (on multiple EC2)
-USE devopsdb;
-SELECT * FROM users;
-exit;
+| Component | Service / Tool |
+|---|---|
+| Compute | AWS EC2 (Amazon Linux, Auto Scaling) |
+| Load balancing | AWS Application Load Balancer |
+| Shared storage | Amazon EFS |
+| Object storage | Amazon S3 |
+| Database | Amazon RDS MySQL (Multi-AZ) |
+| Networking | AWS VPC, subnets, IGW, NAT Gateway |
+| Security | AWS IAM, Security Groups |
+| Application | Python 3, Flask, PyMySQL |
+| Observability | Amazon CloudWatch |
